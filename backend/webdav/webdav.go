@@ -343,9 +343,13 @@ func (f *Fs) setDigestChallenge(resp *http.Response) bool {
 	if f.digestChal == nil {
 		fs.Debugf(f, "Server requires digest authentication")
 	}
-	f.digestChal = chal
-	f.digestHost = resp.Request.URL.Hostname()
-	f.digestCount = 0
+	// Only reset the nonce count if this is a new nonce, otherwise
+	// concurrent challenges could make us re-use a count
+	if f.digestChal == nil || f.digestChal.Nonce != chal.Nonce {
+		f.digestChal = chal
+		f.digestHost = resp.Request.URL.Hostname()
+		f.digestCount = 0
+	}
 	return true
 }
 
