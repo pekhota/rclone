@@ -333,8 +333,9 @@ func (f *Fs) setDigestChallenge(resp *http.Response) bool {
 		return false
 	}
 	// A request we already signed with digest has been rejected, so the
-	// credentials must be wrong
-	if digest.IsDigest(resp.Request.Header.Get("Authorization")) {
+	// credentials must be wrong. The exception is a stale challenge, which
+	// means the nonce expired and we should sign again with the new one.
+	if digest.IsDigest(resp.Request.Header.Get("Authorization")) && !chal.Stale {
 		return false
 	}
 	f.digestMu.Lock()

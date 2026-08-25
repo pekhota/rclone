@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -337,4 +338,55 @@ func TestDigestAuth(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.Equal(t, "existing.txt", entries[0].Remote())
+}
+
+// TestDigestAuthStaleNonce checks that a request signed with an expired
+// nonce is signed again with the replacement the server sends.
+func TestDigestAuthStaleNonce(t *testing.T) {
+	var mu sync.Mutex
+	var schemes []string
+	var digestRequests int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scheme := "none"
+		if authorization := r.Header.Get("Authorization"); authorization != "" {
+			scheme = strings.SplitN(authorization, " ", 2)[0]
+		}
+		mu.Lock()
+		schemes = append(schemes, scheme)
+		if scheme == "Digest" {
+			digestRequests++
+		}
+		n := digestRequests
+		mu.Unlock()
+
+		// Reject the first digest attempt as stale, then accept
+		if scheme != "Digest" || n == 1 {
+			stale := ""
+			if scheme == "Digest" {
+				stale = `, stale=true`
+			}
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Digest realm=%q, nonce="nonce-%d", algorithm=MD5, qop="auth"%s`, digestRealm, n, stale))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusMultiStatus)
+		_, err := fmt.Fprint(w, `<d:multistatus xmlns:d="DAV:"></d:multistatus>`)
+		require.NoError(t, err)
+	}))
+	defer ts.Close()
+
+	configfile.Install()
+	f, err := webdav.NewFs(context.Background(), remoteName, "", configmap.Simple{
+		"type": "webdav",
+		"url":  ts.URL,
+		"user": digestUser,
+		"pass": obscure.MustObscure(digestPass),
+	})
+	require.NoError(t, err)
+
+	_, err = f.List(context.Background(), "")
+	require.NoError(t, err)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"Basic", "Digest", "Digest"}, schemes)
 }
