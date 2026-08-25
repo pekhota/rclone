@@ -2,14 +2,19 @@ package webdav_test
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 
+	auth "github.com/abbot/go-http-auth"
 	"github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/backend/webdav"
 	"github.com/rclone/rclone/fs"
@@ -19,6 +24,7 @@ import (
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	xwebdav "golang.org/x/net/webdav"
 )
 
 var (
@@ -283,4 +289,52 @@ func TestCopyFallsBackWhenRangeIgnored(t *testing.T) {
 	assert.Positive(t, rangeRequests.Load())
 	assert.LessOrEqual(t, rangeRequests.Load(), int32(3))
 	assert.Equal(t, int32(1), fullRequests.Load())
+}
+
+const (
+	digestRealm = "rclone-test"
+	digestUser  = "alice"
+	digestPass  = "secret"
+)
+
+// digestServer runs a WebDAV server on dir which accepts digest
+// authentication only.
+func digestServer(t *testing.T, dir string) *httptest.Server {
+	dav := &xwebdav.Handler{
+		FileSystem: xwebdav.Dir(dir),
+		LockSystem: xwebdav.NewMemLS(),
+	}
+	authenticator := auth.NewDigestAuthenticator(digestRealm, func(user, realm string) string {
+		if user != digestUser || realm != digestRealm {
+			return ""
+		}
+		// digest secrets are HA1, i.e. MD5(user:realm:password)
+		ha1 := md5.Sum([]byte(digestUser + ":" + digestRealm + ":" + digestPass))
+		return hex.EncodeToString(ha1[:])
+	})
+	ts := httptest.NewServer(authenticator.JustCheck(dav.ServeHTTP))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// TestDigestAuth checks that a server which only accepts digest
+// authentication can be listed.
+func TestDigestAuth(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "existing.txt"), []byte("0123456789"), 0600))
+	ts := digestServer(t, dir)
+
+	configfile.Install()
+	f, err := webdav.NewFs(context.Background(), remoteName, "", configmap.Simple{
+		"type": "webdav",
+		"url":  ts.URL,
+		"user": digestUser,
+		"pass": obscure.MustObscure(digestPass),
+	})
+	require.NoError(t, err)
+
+	entries, err := f.List(context.Background(), "")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "existing.txt", entries[0].Remote())
 }
