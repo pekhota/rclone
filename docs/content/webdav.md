@@ -120,7 +120,9 @@ This needs no configuration.
 
 Note that the first request of a session is still sent using basic
 authentication, so use an `https` URL if you don't want your password to
-be readable on the wire.
+be readable on the wire. If you know in advance that the server wants
+digest, set `digest = true` in the config for the remote and rclone
+won't send the password that way at all.
 
 ### Modification times and hashes
 

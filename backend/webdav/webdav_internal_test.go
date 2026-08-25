@@ -390,3 +390,47 @@ func TestDigestAuthStaleNonce(t *testing.T) {
 	defer mu.Unlock()
 	assert.Equal(t, []string{"Basic", "Digest", "Digest"}, schemes)
 }
+
+// TestDigestAuthConfigured checks that a remote configured for digest
+// doesn't send the password using basic authentication.
+func TestDigestAuthConfigured(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "existing.txt"), []byte("0123456789"), 0600))
+
+	var mu sync.Mutex
+	var schemes []string
+	dav := digestServer(t, dir)
+	// Record the scheme of every request, including the ones the digest
+	// authenticator rejects before the handler sees them
+	recorded := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scheme := "none"
+		if authorization := r.Header.Get("Authorization"); authorization != "" {
+			scheme = strings.SplitN(authorization, " ", 2)[0]
+		}
+		mu.Lock()
+		schemes = append(schemes, scheme)
+		mu.Unlock()
+		dav.Config.Handler.ServeHTTP(w, r)
+	}))
+	defer recorded.Close()
+
+	configfile.Install()
+	f, err := webdav.NewFs(context.Background(), remoteName, "", configmap.Simple{
+		"type":   "webdav",
+		"url":    recorded.URL,
+		"user":   digestUser,
+		"pass":   obscure.MustObscure(digestPass),
+		"digest": "true",
+	})
+	require.NoError(t, err)
+
+	entries, err := f.List(context.Background(), "")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotEmpty(t, schemes)
+	assert.Equal(t, "none", schemes[0], "the challenge request must not carry credentials")
+	assert.NotContains(t, schemes, "Basic", "the password must never be sent using basic auth")
+}

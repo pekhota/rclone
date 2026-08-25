@@ -121,6 +121,16 @@ func init() {
 			Help:     "Command to run to get a bearer token.",
 			Advanced: true,
 		}, {
+			Name: "digest",
+			Help: `Use digest authentication rather than basic.
+
+Set this if the server is known to want digest authentication. Rclone
+then doesn't send the password using basic authentication while it
+fetches the digest challenge.
+`,
+			Advanced: true,
+			Default:  false,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     configEncodingHelp,
 			Advanced: true,
@@ -200,6 +210,7 @@ type Options struct {
 	Pass               string               `config:"pass"`
 	BearerToken        string               `config:"bearer_token"`
 	BearerTokenCommand fs.SpaceSepList      `config:"bearer_token_command"`
+	Digest             bool                 `config:"digest"`
 	Enc                encoder.MultiEncoder `config:"encoding"`
 	Headers            fs.CommaSepList      `config:"headers"`
 	PacerMinSleep      fs.Duration          `config:"pacer_min_sleep"`
@@ -636,7 +647,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)
 	if f.hasUserPass() {
-		f.srv.SetUserPass(opt.User, opt.Pass)
+		if !opt.Digest {
+			// Servers which want digest authentication reject this
+			// with the challenge needed to sign requests properly
+			f.srv.SetUserPass(opt.User, opt.Pass)
+		}
 	} else if opt.BearerToken != "" {
 		f.setBearerToken(opt.BearerToken)
 	} else if len(f.opt.BearerTokenCommand) != 0 {
