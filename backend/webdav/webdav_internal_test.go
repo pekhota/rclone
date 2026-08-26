@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -511,4 +512,50 @@ func TestDigestAuthUploadFetchesChallengeFirst(t *testing.T) {
 	}
 	assert.Equal(t, 1, puts, "the body should only be sent once")
 	assert.Equal(t, "PROPFIND", methods[0], "the challenge should come from a retryable request")
+}
+
+// TestDigestAuthConfiguredRefusesBasic checks that a remote configured for
+// digest doesn't send the password to a server which asks for basic, and
+// says why it is refusing.
+func TestDigestAuthConfiguredRefusesBasic(t *testing.T) {
+	var mu sync.Mutex
+	var schemes []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scheme := "none"
+		if authorization := r.Header.Get("Authorization"); authorization != "" {
+			scheme = strings.SplitN(authorization, " ", 2)[0]
+		}
+		mu.Lock()
+		schemes = append(schemes, scheme)
+		mu.Unlock()
+		w.Header().Set("WWW-Authenticate", `Basic realm="`+digestRealm+`"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer ts.Close()
+
+	var captured bytes.Buffer
+	fs.SetLogger(slog.NewTextHandler(&captured, &slog.HandlerOptions{Level: slog.LevelError}))
+	defer fs.SetLogger(slog.NewTextHandler(io.Discard, nil))
+
+	configfile.Install()
+	f, err := webdav.NewFs(context.Background(), remoteName, "", configmap.Simple{
+		"type":   "webdav",
+		"url":    ts.URL,
+		"user":   digestUser,
+		"pass":   obscure.MustObscure(digestPass),
+		"digest": "true",
+	})
+	require.NoError(t, err)
+
+	// Several failures shouldn't repeat the message
+	for range 3 {
+		_, err = f.List(context.Background(), "")
+		require.Error(t, err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"none", "none", "none"}, schemes, "the password must not be sent")
+	assert.Equal(t, 1, strings.Count(captured.String(), "not sending the password"),
+		"the warning should only be logged once")
 }

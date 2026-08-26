@@ -253,6 +253,7 @@ type Fs struct {
 	digestHost         string            // host which issued digestChal
 	digestCount        int               // number of times digestChal has been used
 	digestRemember     sync.Once         // makes sure the config is only updated once
+	digestWarn         sync.Once         // makes sure the downgrade warning is only logged once
 }
 
 // Object describes a webdav object
@@ -340,6 +341,11 @@ func (f *Fs) setDigestChallenge(resp *http.Response) bool {
 	chal, err := digest.FindChallenge(resp.Header)
 	if err != nil {
 		// The server wants something other than digest, e.g. basic auth
+		if f.opt.Digest {
+			f.digestWarn.Do(func() {
+				fs.Errorf(f, "Server asked for authentication without offering digest - not sending the password. Remove digest = true from the config to allow basic authentication.")
+			})
+		}
 		return false
 	}
 	if resp.Request == nil {
