@@ -1,6 +1,7 @@
 package webdav_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	auth "github.com/abbot/go-http-auth"
 	"github.com/rclone/rclone/backend/local"
@@ -22,6 +24,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configfile"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -459,4 +462,53 @@ func TestDigestAuthRemembered(t *testing.T) {
 	digest, ok := m.Get("digest")
 	assert.True(t, ok, "digest should have been written to the config")
 	assert.Equal(t, "true", digest)
+}
+
+// TestDigestAuthUploadFetchesChallengeFirst checks that an upload which is
+// the first request of a session isn't sent twice.
+//
+// An upload can't be retried as its body can't be rewound, so the challenge
+// has to be fetched by a request which can be.
+func TestDigestAuthUploadFetchesChallengeFirst(t *testing.T) {
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	var methods []string
+	dav := digestServer(t, t.TempDir())
+	recorded := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		methods = append(methods, r.Method)
+		mu.Unlock()
+		dav.Config.Handler.ServeHTTP(w, r)
+	}))
+	defer recorded.Close()
+
+	configfile.Install()
+	f, err := webdav.NewFs(ctx, remoteName, "", configmap.Simple{
+		"type":   "webdav",
+		"url":    recorded.URL,
+		"user":   digestUser,
+		"pass":   obscure.MustObscure(digestPass),
+		"digest": "true",
+	})
+	require.NoError(t, err)
+
+	// Uploading to the root of the remote makes the PUT the first request,
+	// as no parent directory has to be made
+	contents := "uploaded without a preceding request"
+	src := object.NewStaticObjectInfo("root.txt", time.Now(), int64(len(contents)), true, nil, nil)
+	o, err := f.Put(ctx, bytes.NewBufferString(contents), src)
+	require.NoError(t, err)
+	assert.Equal(t, int64(len(contents)), o.Size())
+
+	mu.Lock()
+	defer mu.Unlock()
+	puts := 0
+	for _, method := range methods {
+		if method == "PUT" {
+			puts++
+		}
+	}
+	assert.Equal(t, 1, puts, "the body should only be sent once")
+	assert.Equal(t, "PROPFIND", methods[0], "the challenge should come from a retryable request")
 }

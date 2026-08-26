@@ -368,6 +368,29 @@ func (f *Fs) setDigestChallenge(resp *http.Response) bool {
 	return true
 }
 
+// fetchDigestChallenge makes sure a digest challenge has been fetched
+// before an upload is started.
+//
+// An upload can't be retried because its body can't be rewound, so it
+// mustn't be the request which discovers the challenge - a PROPFIND,
+// which can be retried, collects it instead.
+func (f *Fs) fetchDigestChallenge(ctx context.Context) {
+	if !f.opt.Digest {
+		return
+	}
+	f.digestMu.Lock()
+	have := f.digestChal != nil
+	f.digestMu.Unlock()
+	if have {
+		return
+	}
+	_, _, _ = f.authSingleflight.Do("digestChallenge", func() (any, error) {
+		// Called for the 401 it provokes, so the result doesn't matter
+		_ = f._dirExists(ctx, f.dirPath(""))
+		return nil, nil
+	})
+}
+
 // rememberDigest records in the config that this remote needs digest
 // authentication, so that later sessions don't send the password using
 // basic authentication to fetch the challenge.
@@ -1730,6 +1753,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 //
 // The new object may have been created if an error is returned
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
+	o.fs.fetchDigestChallenge(ctx)
 	err = o.fs.mkParentDir(ctx, o.filePath())
 	if err != nil {
 		return fmt.Errorf("Update mkParentDir failed: %w", err)
