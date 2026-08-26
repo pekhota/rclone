@@ -318,16 +318,14 @@ func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (b
 		}
 		return true, err
 	}
-	// If the server asked us for digest authentication then sign the next
-	// attempt with the challenge it sent
+	// If the server asked for digest authentication then sign the retry with it
 	if f.hasUserPass() && resp != nil && resp.StatusCode == 401 && f.setDigestChallenge(resp) {
 		return true, err
 	}
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
-// hasUserPass returns true if the remote is configured with a user name
-// or a password.
+// hasUserPass returns true if a user name or password is configured
 func (f *Fs) hasUserPass() bool {
 	return f.opt.User != "" || f.opt.Pass != ""
 }
@@ -438,9 +436,8 @@ func (f *Fs) digestAuthorization(req *http.Request) (string, error) {
 
 // digestRoundTripper signs requests with digest authentication.
 //
-// The signature covers the request method and URI, so it has to be made for
-// each request actually sent rather than once before the client sends it -
-// following a redirect produces a new request which needs its own signature.
+// The signature covers the request method and URI, so each request sent needs
+// its own - in particular each hop of a redirect.
 type digestRoundTripper struct {
 	fs *Fs
 	rt http.RoundTripper
@@ -683,7 +680,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		}
 	}
 	if f.hasUserPass() {
-		// Sign requests once the server has asked for digest authentication
+		// Signs requests after the server has asked for digest authentication
 		client.Transport = &digestRoundTripper{fs: f, rt: client.Transport}
 	}
 	// Refuse redirects that downgrade HTTPS to plaintext HTTP.
@@ -695,8 +692,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}).Fill(ctx, f)
 	if f.hasUserPass() {
 		if !opt.Digest {
-			// Servers which want digest authentication reject this
-			// with the challenge needed to sign requests properly
+			// Servers wanting digest reject this with the challenge we need
 			f.srv.SetUserPass(opt.User, opt.Pass)
 		}
 	} else if opt.BearerToken != "" {
