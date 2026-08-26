@@ -247,10 +247,12 @@ type Fs struct {
 	canChunk           bool          // set if nextcloud and nextcloud_chunk_size is set
 	canRecalcHash      bool          // set if the server can recalculate checksums with PATCH (nextcloud)
 	authSingleflight   *singleflight.Group
+	m                  configmap.Mapper  // the config for this remote
 	digestMu           sync.Mutex        // protects the digest fields below
 	digestChal         *digest.Challenge // challenge to sign requests with, nil if not using digest auth
 	digestHost         string            // host which issued digestChal
 	digestCount        int               // number of times digestChal has been used
+	digestRemember     sync.Once         // makes sure the config is only updated once
 }
 
 // Object describes a webdav object
@@ -350,18 +352,33 @@ func (f *Fs) setDigestChallenge(resp *http.Response) bool {
 		return false
 	}
 	f.digestMu.Lock()
-	defer f.digestMu.Unlock()
-	if f.digestChal == nil {
-		fs.Debugf(f, "Server requires digest authentication")
-	}
+	first := f.digestChal == nil
 	// Only reset the nonce count if this is a new nonce, otherwise
 	// concurrent challenges could make us re-use a count
-	if f.digestChal == nil || f.digestChal.Nonce != chal.Nonce {
+	if first || f.digestChal.Nonce != chal.Nonce {
 		f.digestChal = chal
 		f.digestHost = resp.Request.URL.Hostname()
 		f.digestCount = 0
 	}
+	f.digestMu.Unlock()
+	if first {
+		fs.Debugf(f, "Server requires digest authentication")
+		f.rememberDigest()
+	}
 	return true
+}
+
+// rememberDigest records in the config that this remote needs digest
+// authentication, so that later sessions don't send the password using
+// basic authentication to fetch the challenge.
+func (f *Fs) rememberDigest() {
+	if f.opt.Digest || f.m == nil {
+		return
+	}
+	f.digestRemember.Do(func() {
+		fs.Debugf(f, "Setting digest = true in the config")
+		f.m.Set("digest", "true")
+	})
 }
 
 // digestAuthorization returns the Authorization header to sign req with, or
@@ -612,6 +629,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		pacer:            fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(opt.PacerMinSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		precision:        fs.ModTimeNotSupported,
 		authSingleflight: new(singleflight.Group),
+		m:                m,
 	}
 
 	var client *http.Client

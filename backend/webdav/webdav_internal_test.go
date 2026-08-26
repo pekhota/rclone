@@ -434,3 +434,29 @@ func TestDigestAuthConfigured(t *testing.T) {
 	assert.Equal(t, "none", schemes[0], "the challenge request must not carry credentials")
 	assert.NotContains(t, schemes, "Basic", "the password must never be sent using basic auth")
 }
+
+// TestDigestAuthRemembered checks that discovering digest authentication
+// records it in the config, so later sessions don't send the password
+// using basic authentication.
+func TestDigestAuthRemembered(t *testing.T) {
+	ts := digestServer(t, t.TempDir())
+
+	configfile.Install()
+	m := configmap.Simple{
+		"type": "webdav",
+		"url":  ts.URL,
+		"user": digestUser,
+		"pass": obscure.MustObscure(digestPass),
+	}
+	f, err := webdav.NewFs(context.Background(), remoteName, "", m)
+	require.NoError(t, err)
+	_, ok := m.Get("digest")
+	require.False(t, ok, "digest should not be set before anything is asked of the server")
+
+	_, err = f.List(context.Background(), "")
+	require.NoError(t, err)
+
+	digest, ok := m.Get("digest")
+	assert.True(t, ok, "digest should have been written to the config")
+	assert.Equal(t, "true", digest)
+}
