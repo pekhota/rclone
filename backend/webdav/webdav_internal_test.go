@@ -559,3 +559,157 @@ func TestDigestAuthConfiguredRefusesBasic(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(captured.String(), "not sending the password"),
 		"the warning should only be logged once")
 }
+
+// newDigestFs makes an Fs pointing at ts with the password given
+func newDigestFs(t *testing.T, ts *httptest.Server, pass string) (fs.Fs, error) {
+	configfile.Install()
+	return webdav.NewFs(context.Background(), remoteName, "", configmap.Simple{
+		"type": "webdav",
+		"url":  ts.URL,
+		"user": digestUser,
+		"pass": obscure.MustObscure(pass),
+	})
+}
+
+// TestDigestAuthRedirectIsResigned checks that a redirected request is signed
+// again for the URI it ends up at.
+//
+// A digest signature covers the request URI, so the signature made for the
+// original URI is rejected by servers which check it - Apache answers 400
+// with "uri mismatch" (AH01786). WebDAV servers commonly redirect a
+// collection which was asked for without its trailing slash.
+func TestDigestAuthRedirectIsResigned(t *testing.T) {
+	var uriMismatch atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authorization, "Digest ") {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Digest realm=%q, nonce="redirect-nonce", algorithm=MD5, qop="auth"`, digestRealm))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if !strings.Contains(authorization, fmt.Sprintf("uri=%q", r.URL.RequestURI())) {
+			uriMismatch.Add(1)
+			http.Error(w, "uri mismatch", http.StatusBadRequest)
+			return
+		}
+		if r.URL.Path == "/file.txt" {
+			http.Redirect(w, r, "/file.txt/", http.StatusMovedPermanently)
+			return
+		}
+		w.WriteHeader(http.StatusMultiStatus)
+		_, err := fmt.Fprint(w, fileInfoResponse)
+		require.NoError(t, err)
+	}))
+	defer ts.Close()
+
+	f, err := newDigestFs(t, ts, digestPass)
+	require.NoError(t, err)
+
+	_, err = f.NewObject(context.Background(), "file.txt")
+	require.NoError(t, err)
+	assert.Zero(t, uriMismatch.Load(), "the redirected request should carry a signature for its own URI")
+}
+
+// TestDigestAuthRedirectHostCase checks that a redirect which changes the case
+// of the host name is still signed.
+//
+// Host names are case insensitive (RFC 3986 section 3.2.2) but net/url keeps
+// whatever case the Location header used.
+func TestDigestAuthRedirectHostCase(t *testing.T) {
+	var mu sync.Mutex
+	var signedPaths []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authorization, "Digest ") {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Digest realm=%q, nonce="case-nonce", algorithm=MD5, qop="auth"`, digestRealm))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		signedPaths = append(signedPaths, r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path == "/file.txt" {
+			// Redirect to the same host spelled in a different case
+			http.Redirect(w, r, "http://LOCALHOST:"+strings.Split(r.Host, ":")[1]+"/file.txt/", http.StatusMovedPermanently)
+			return
+		}
+		w.WriteHeader(http.StatusMultiStatus)
+		_, err := fmt.Fprint(w, fileInfoResponse)
+		require.NoError(t, err)
+	}))
+	defer ts.Close()
+
+	configfile.Install()
+	f, err := webdav.NewFs(context.Background(), remoteName, "", configmap.Simple{
+		"type": "webdav",
+		"url":  strings.Replace(ts.URL, "127.0.0.1", "localhost", 1),
+		"user": digestUser,
+		"pass": obscure.MustObscure(digestPass),
+	})
+	require.NoError(t, err)
+
+	_, err = f.NewObject(context.Background(), "file.txt")
+	require.NoError(t, err)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Contains(t, signedPaths, "/file.txt/", "the redirected request should have been signed")
+}
+
+// TestDigestAuthWrongPassword checks that bad credentials fail immediately
+// rather than being retried against the server.
+func TestDigestAuthWrongPassword(t *testing.T) {
+	var mu sync.Mutex
+	var schemes []string
+	dav := digestServer(t, t.TempDir())
+	recorded := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scheme := "none"
+		if authorization := r.Header.Get("Authorization"); authorization != "" {
+			scheme = strings.SplitN(authorization, " ", 2)[0]
+		}
+		mu.Lock()
+		schemes = append(schemes, scheme)
+		mu.Unlock()
+		dav.Config.Handler.ServeHTTP(w, r)
+	}))
+	defer recorded.Close()
+
+	f, err := newDigestFs(t, recorded, "wrong-password")
+	require.NoError(t, err)
+
+	_, err = f.List(context.Background(), "")
+	require.Error(t, err)
+
+	// One attempt with basic to get the challenge and one with digest,
+	// which is rejected and must not be retried further
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"Basic", "Digest"}, schemes)
+}
+
+// TestBasicAuthNotRetried checks that a 401 from a server which doesn't offer
+// digest is reported straight away.
+func TestBasicAuthNotRetried(t *testing.T) {
+	var mu sync.Mutex
+	var schemes []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scheme := "none"
+		if authorization := r.Header.Get("Authorization"); authorization != "" {
+			scheme = strings.SplitN(authorization, " ", 2)[0]
+		}
+		mu.Lock()
+		schemes = append(schemes, scheme)
+		mu.Unlock()
+		w.Header().Set("WWW-Authenticate", `Basic realm="`+digestRealm+`"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer ts.Close()
+
+	f, err := newDigestFs(t, ts, digestPass)
+	require.NoError(t, err)
+
+	_, err = f.List(context.Background(), "")
+	require.Error(t, err)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"Basic"}, schemes)
+}
